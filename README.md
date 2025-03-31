@@ -4,7 +4,7 @@
 The ISS Tracker is a Flask-based web application that provides real-time and historical location data for the International Space Station (ISS). The project retrieves ISS state vectors, calculates geospatial data, and serves it through multiple API endpoints. It uses Redis for data storage and is containerized using Docker Compose.
 
 ## Data Source
-The ISS state vector data is sourced from [NASA's SpaceTrack API](https://www.space-track.org/). This data is processed to determine ISS position, velocity, and other relevant details.
+The ISS state vector data is sourced from [NASA's API](https://nasa-public-data.s3.amazonaws.com/iss-coords/current/ISS_OEM/ISS.OEM_J2K_EPH.xml). This data is processed to determine ISS position, velocity, and other relevant details.
 
 ## Deployment with Docker Compose
 To deploy the ISS Tracker using Docker Compose:
