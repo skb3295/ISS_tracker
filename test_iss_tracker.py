@@ -1,18 +1,16 @@
 import pytest
 import numpy as np
-from iss_tracker import app, load_iss_data, rd
+from iss_tracker import station_tracker, fetch_orbital_data, database
 import redis
 
-rd = redis.Redis(host='redis-db', port=6379, db=0)
-
-@pytest.fixture #generated with AI, see 'AI Usage' in ReadME for explanation (also used and explained in homework05)
+@pytest.fixture 
 def client():
     """
     Fixture to set up the Flask test client and initialize Redis with ISS data
     """
-    rd.flushdb()
-    load_iss_data()
-    with app.test_client() as client:
+    database.flushdb()
+    fetch_orbital_data()
+    with station_tracker.test_client() as client:
         yield client
 
 def test_get_epochs(client):
@@ -37,7 +35,7 @@ def test_get_epoch(client):
     """
     response = client.get('/epochs')
     data = response.get_json()
-    first_epoch = data[0]
+    first_epoch = data[0]['epoch']
 
     first_response = client.get(f'/epochs/{first_epoch}')
     first_response_data = first_response.get_json()
@@ -50,7 +48,7 @@ def test_get_epoch_speed(client):
     """
     response = client.get('/epochs')
     data = response.get_json()
-    first_epoch = data[0]
+    first_epoch = data[0]['epoch']
 
     first_response = client.get(f'/epochs/{first_epoch}')
     first_response_data = first_response.get_json()
@@ -100,7 +98,7 @@ def test_get_epoch_location(client):
     """
     response = client.get('/epochs')
     data = response.get_json()
-    first_epoch = data[0]
+    first_epoch = data[0]['epoch']
 
     # Request location data for the first epoch
     location_response = client.get(f'/epochs/{first_epoch}/location')

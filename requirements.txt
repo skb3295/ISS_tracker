@@ -6,4 +6,4 @@ logging
 redis
 geopy
 astropy
-
+pytest

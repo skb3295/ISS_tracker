@@ -10,59 +10,73 @@ from geopy.geocoders import Nominatim
 from astropy import coordinates, units
 from astropy.time import Time
 
-rd = redis.Redis(host='redis-db', port=6379, db=0)
+# Redis connection with retry mechanism
+def establish_database_connection():
+    max_attempts = 5
+    wait_time = 2
+    
+    for attempt in range(max_attempts):
+        try:
+            db_client = redis.Redis(host='redis-db', port=6379, db=0)
+            db_client.ping()  # Verify connection
+            return db_client
+        except redis.exceptions.ConnectionError as e:
+            if attempt < max_attempts - 1:
+                logging.warning(f"Database connection attempt {attempt+1} failed, retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                logging.error(f"Database connection failed after {max_attempts} attempts")
+                raise e
 
-app = Flask(__name__)
+# Initialize database connection
+database = establish_database_connection()
 
-def load_iss_data():  # copied from main() function from previous homework
-    '''
-    This function loads the data so it's easier for future flask functions to access
+# Initialize application
+station_tracker = Flask(__name__)
 
-    Args: None
-
-    Returns: global variable that has the parsed data
-    '''
-    url = "https://nasa-public-data.s3.amazonaws.com/iss-coords/current/ISS_OEM/ISS.OEM_J2K_EPH.xml"
-    response = requests.get(url)
-
-    # returns error if it's not read in properly
-    if response.text == ' ':
-        logging.error('Data was not imported successfully')
-
-    data = xmltodict.parse(response.text)
-    state_vectors = data['ndm']['oem']['body']['segment']['data']['stateVector']
-
-    # store each state vector in Redis using EPOCH as the key
-    for sv in state_vectors:
-        epoch = sv['EPOCH']
-        rd.set(epoch, json.dumps(sv))  # serialize the state vector as a JSON string
-
-#given in Frequently Encountered Problems
-def compute_location_astropy(sv):
+def fetch_orbital_data():
     """
-    Computes latitude, longitude, and altitude using astropy.
-
-    Args:
-        sv (dict): State vector containing X, Y, Z, and EPOCH.
-
-    Returns:
-        tuple: (latitude, longitude, altitude)
+    Retrieve and store orbital data from NASA's public repository
     """
-    x = float(sv['X']['#text'])
-    y = float(sv['Y']['#text'])
-    z = float(sv['Z']['#text'])
+    source_url = "https://nasa-public-data.s3.amazonaws.com/iss-coords/current/ISS_OEM/ISS.OEM_J2K_EPH.xml"
+    response = requests.get(source_url)
+    
+    if not response.text or response.status_code != 200:
+        logging.error('Failed to retrieve orbital data')
+        return False
+        
+    parsed_data = xmltodict.parse(response.text)
+    orbital_vectors = parsed_data['ndm']['oem']['body']['segment']['data']['stateVector']
+    
+    # Store each vector in database
+    for vector in orbital_vectors:
+        timestamp = vector['EPOCH']
+        database.set(timestamp, json.dumps(vector))
+    
+    return True
 
-    this_epoch = time.strftime('%Y-%m-%d %H:%M:%S', time.strptime(sv['EPOCH'][:-5], '%Y-%jT%H:%M:%S'))
+def calculate_earth_coordinates(vector):
+    """
+    Transform space coordinates to Earth-based lat/long/alt
+    """
+    x_pos = float(vector['X']['#text'])
+    y_pos = float(vector['Y']['#text'])
+    z_pos = float(vector['Z']['#text'])
+    
+    # Format timestamp for astropy
+    formatted_time = time.strftime('%Y-%m-%d %H:%M:%S', 
+                                  time.strptime(vector['EPOCH'][:-5], '%Y-%jT%H:%M:%S'))
+    
+    # Use astropy to calculate Earth-relative position
+    cart_coords = coordinates.CartesianRepresentation([x_pos, y_pos, z_pos], unit=units.km)
+    space_ref = coordinates.GCRS(cart_coords, obstime=formatted_time)
+    earth_ref = space_ref.transform_to(coordinates.ITRS(obstime=formatted_time))
+    position = coordinates.EarthLocation(*earth_ref.cartesian.xyz)
+    
+    return position.lat.value, position.lon.value, position.height.value
 
-    cartrep = coordinates.CartesianRepresentation([x, y, z], unit=units.km)
-    gcrs = coordinates.GCRS(cartrep, obstime=this_epoch)
-    itrs = gcrs.transform_to(coordinates.ITRS(obstime=this_epoch))
-    loc = coordinates.EarthLocation(*itrs.cartesian.xyz)
-
-    return loc.lat.value, loc.lon.value, loc.height.value
-
-# returns entire list of epochs
-@app.route('/epochs', methods=['GET'])
+# Original route: returns entire list of epochs
+@station_tracker.route('/epochs', methods=['GET'])
 def get_epochs():
     """
     Returns the list of epochs and their state vectors, with optional limit and offset.
@@ -75,7 +89,7 @@ def get_epochs():
     offset = request.args.get('offset', default=0, type=int)
 
     # get all keys (epochs) from Redis
-    epochs = rd.keys()
+    epochs = database.keys()
     epochs = [epoch.decode() for epoch in epochs]
 
     # Apply limit and offset
@@ -87,7 +101,7 @@ def get_epochs():
     # get state vectors for each epoch
     result = []
     for epoch in epochs:
-        state_vector = json.loads(rd.get(epoch))
+        state_vector = json.loads(database.get(epoch))
         result.append({
             "epoch": epoch,
             "state_vector": state_vector
@@ -95,8 +109,8 @@ def get_epochs():
 
     return result
 
-# returns state vectors for epoch
-@app.route('/epochs/<epoch>', methods=['GET'])
+# Original route: returns state vectors for epoch
+@station_tracker.route('/epochs/<epoch>', methods=['GET'])
 def get_epoch(epoch):
     """
     Returns state vector for specific epoch
@@ -105,15 +119,15 @@ def get_epoch(epoch):
 
     Returns: data (List[dict]) dictionary value of that specified epoch
     """
-    if not rd.exists(epoch):
+    if not database.exists(epoch):
         return {"error": "Epoch not found"}, 404
 
     # retrieve the state vector from Redis and deserialize it
-    state_vector = json.loads(rd.get(epoch))
+    state_vector = json.loads(database.get(epoch))
     return state_vector
 
-# returns specific epoch speed
-@app.route('/epochs/<epoch>/speed', methods=['GET'])
+# Original route: returns specific epoch speed
+@station_tracker.route('/epochs/<epoch>/speed', methods=['GET'])
 def get_epoch_speed(epoch):
     """
     Returns speed of specific epoch
@@ -122,11 +136,11 @@ def get_epoch_speed(epoch):
 
     Returns: speed (int) calculated speed of specified epoch using the X Y and Z dots
     """
-    if not rd.exists(epoch):
+    if not database.exists(epoch):
         return {"error": "Epoch not found"}, 404
 
     # retrieve the state vector from Redis and deserialize it
-    state_vector = json.loads(rd.get(epoch))
+    state_vector = json.loads(database.get(epoch))
 
     X = float(state_vector['X_DOT']['#text'])
     Y = float(state_vector['Y_DOT']['#text'])
@@ -134,8 +148,8 @@ def get_epoch_speed(epoch):
     speed = np.sqrt(np.square(X) + np.square(Y) + np.square(Z))
     return {"speed": speed}
 
-# returns closest epoch to 'now'
-@app.route('/now', methods=['GET'])
+# Original route: returns closest epoch to 'now'
+@station_tracker.route('/now', methods=['GET'])
 def get_now():
     """
     Returns the state vectors of the epoch closest to 'now'
@@ -149,7 +163,7 @@ def get_now():
     closest_diff = float('inf')
 
     # searches all keys in Redis
-    for epoch in rd.keys():
+    for epoch in database.keys():
         epoch = epoch.decode()
         epoch_str = epoch.split('.')[0]
         epoch_time = time.mktime(time.strptime(epoch_str, '%Y-%jT%H:%M:%S'))
@@ -161,9 +175,9 @@ def get_now():
 
     if closest_epoch:
        
-        state_vector = json.loads(rd.get(closest_epoch))
+        state_vector = json.loads(database.get(closest_epoch))
 
-        lat, lon, alt = compute_location_astropy(state_vector)
+        lat, lon, alt = calculate_earth_coordinates(state_vector)
 
         #taken from hint posted
         geocoder = Nominatim(user_agent='iss_tracker')
@@ -179,8 +193,8 @@ def get_now():
         }
     return {"error": "No data available"}, 404
 
-# Returns location for a specific epoch
-@app.route('/epochs/<epoch>/location', methods=['GET'])
+# Original route: Returns location for a specific epoch
+@station_tracker.route('/epochs/<epoch>/location', methods=['GET'])
 def get_epoch_location(epoch):
     """
     Returns latitude, longitude, altitude, and geoposition for a given epoch.
@@ -189,13 +203,13 @@ def get_epoch_location(epoch):
 
     Returns: dict: Contains latitude, longitude, altitude, and geoposition.
     """
-    if not rd.exists(epoch):
+    if not database.exists(epoch):
         return {"error": "Epoch not found"}, 404
 
     # retrieve the state vector from Redis and deserialize it
-    state_vector = json.loads(rd.get(epoch))
+    state_vector = json.loads(database.get(epoch))
 
-    lat, lon, alt = compute_location_astropy(state_vector)
+    lat, lon, alt = calculate_earth_coordinates(state_vector)
 
     geocoder = Nominatim(user_agent='iss_tracker')
     geoloc = geocoder.reverse((lat, lon), zoom=15, language='en')
@@ -208,14 +222,13 @@ def get_epoch_location(epoch):
         "epoch_timestamp": epoch
     }
 
-# load data into Redis on startup
-if not rd.keys():
-    load_iss_data()
+# Initialize data on startup if database is empty
+if not database.keys():
+    fetch_orbital_data()
 
-# loads data first
 def main():
-    load_iss_data()
-    app.run(debug=True, host='0.0.0.0')
+    fetch_orbital_data()
+    station_tracker.run(debug=True, host='0.0.0.0')
 
 if __name__ == '__main__':
     main()
