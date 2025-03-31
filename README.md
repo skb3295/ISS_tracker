@@ -81,7 +81,7 @@ curl http://localhost:5000/epochs/<epoch>/speed
 To run the containerized unit tests:
 
 ```sh
-docker compose run --rm app pytest
+docker exec -it iss-tracker pytest
 ```
 
 ## Important Files
